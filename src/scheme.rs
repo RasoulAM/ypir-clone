@@ -30,6 +30,7 @@ pub fn run_ypir_batched(
     num_clients: usize,
     is_simplepir: bool,
     trials: usize,
+    write_to_file: bool,
 ) -> Measurement {
     let params = if is_simplepir {
         params_for_scenario_simplepir(num_items, item_size_bits)
@@ -37,18 +38,18 @@ pub fn run_ypir_batched(
         params_for_scenario(num_items, item_size_bits)
     };
     let measurement = match num_clients {
-        1 => run_ypir_on_params::<1>(params, is_simplepir, trials),
-        2 => run_ypir_on_params::<2>(params, is_simplepir, trials),
-        3 => run_ypir_on_params::<3>(params, is_simplepir, trials),
-        4 => run_ypir_on_params::<4>(params, is_simplepir, trials),
-        5 => run_ypir_on_params::<5>(params, is_simplepir, trials),
-        6 => run_ypir_on_params::<6>(params, is_simplepir, trials),
-        7 => run_ypir_on_params::<7>(params, is_simplepir, trials),
-        8 => run_ypir_on_params::<8>(params, is_simplepir, trials),
-        9 => run_ypir_on_params::<9>(params, is_simplepir, trials),
-        10 => run_ypir_on_params::<10>(params, is_simplepir, trials),
-        11 => run_ypir_on_params::<11>(params, is_simplepir, trials),
-        12 => run_ypir_on_params::<12>(params, is_simplepir, trials),
+        1 => run_ypir_on_params::<1>(params, is_simplepir, trials, write_to_file),
+        2 => run_ypir_on_params::<2>(params, is_simplepir, trials, write_to_file),
+        3 => run_ypir_on_params::<3>(params, is_simplepir, trials, write_to_file),
+        4 => run_ypir_on_params::<4>(params, is_simplepir, trials, write_to_file),
+        5 => run_ypir_on_params::<5>(params, is_simplepir, trials, write_to_file),
+        6 => run_ypir_on_params::<6>(params, is_simplepir, trials, write_to_file),
+        7 => run_ypir_on_params::<7>(params, is_simplepir, trials, write_to_file),
+        8 => run_ypir_on_params::<8>(params, is_simplepir, trials, write_to_file),
+        9 => run_ypir_on_params::<9>(params, is_simplepir, trials, write_to_file),
+        10 => run_ypir_on_params::<10>(params, is_simplepir, trials, write_to_file),
+        11 => run_ypir_on_params::<11>(params, is_simplepir, trials, write_to_file),
+        12 => run_ypir_on_params::<12>(params, is_simplepir, trials, write_to_file),
         _ => panic!("Unsupported number of clients: {}", num_clients),
     };
     debug!("{:#?}", measurement);
@@ -71,7 +72,7 @@ impl Sample for u16 {
     }
 }
 
-pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) -> Measurement {
+pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize, write_to_file: bool) -> Measurement {
     assert_eq!(K, 1); // for now
 
     let is_simplepir = true;
@@ -116,6 +117,25 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
     let offline_values =
         y_server.perform_offline_precomputation_simplepir(Some(&mut measurements[0]));
     let offline_server_time_ms = start_offline_comp.elapsed().as_millis();
+
+    if write_to_file {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let mut file = std::fs::File::create("/tmp/ypir_db.bin").unwrap();
+        let db = y_server.db();
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(db.as_ptr() as *const u8, db.len() * std::mem::size_of::<T>())
+        };
+        file.write_all(bytes).unwrap();
+        file.sync_data().unwrap();
+        
+        let total_size = file.metadata().unwrap().len() as usize;
+        measurements[0].offline.server_long_term_storage_bytes = total_size;
+        
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+    }
 
     let packed_query_row_sz = params.db_rows_padded();
     // let mut all_queries_packed = AlignedMemory64::new(K * packed_query_row_sz);
@@ -201,6 +221,16 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
         // ONLINE PHASE
         // ================================================================
 
+        let start_load = Instant::now();
+        if write_to_file {
+            use std::io::Read;
+            let mut file = std::fs::File::open("/tmp/ypir_db.bin").unwrap();
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).unwrap();
+        }
+        let server_data_load_time_us = start_load.elapsed().as_micros();
+        measurement.online.server_data_load_time_us = server_data_load_time_us as usize;
+
         let start_online_comp = Instant::now();
         let responses = vec![y_server.perform_online_computation_simplepir(
             all_queries_packed.as_slice(),
@@ -209,6 +239,9 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize) 
             Some(&mut measurement),
         )];
         let online_server_time_ms = start_online_comp.elapsed().as_millis();
+        let server_response_latency_us = start_load.elapsed().as_micros();
+        measurement.online.server_response_latency_us = server_response_latency_us as usize;
+        
         let online_download_bytes = get_size_bytes(&responses); // TODO: this is not quite right for multiple clients
 
         // check correctness
@@ -292,9 +325,10 @@ pub fn run_ypir_on_params<const K: usize>(
     params: Params,
     is_simplepir: bool,
     trials: usize,
+    write_to_file: bool,
 ) -> Measurement {
     if is_simplepir {
-        return run_simple_ypir_on_params::<K>(params, trials);
+        return run_simple_ypir_on_params::<K>(params, trials, write_to_file);
     }
     let lwe_params = LWEParams::default();
 
@@ -400,6 +434,25 @@ pub fn run_ypir_on_params<const K: usize>(
     let offline_values = y_server.perform_offline_precomputation(Some(&mut measurements[0]));
     let offline_server_time_ms = start_offline_comp.elapsed().as_millis();
 
+    if write_to_file {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let mut file = std::fs::File::create("/tmp/ypir_db.bin").unwrap();
+        let db = y_server.db();
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(db.as_ptr() as *const u8, db.len() * std::mem::size_of::<u8>())
+        };
+        file.write_all(bytes).unwrap();
+        file.sync_data().unwrap();
+        
+        let total_size = file.metadata().unwrap().len() as usize;
+        measurements[0].offline.server_long_term_storage_bytes = total_size;
+        
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+
     let packed_query_row_sz = params.db_rows_padded();
     // let mut all_queries_packed = AlignedMemory64::new(K * packed_query_row_sz);
 
@@ -502,6 +555,16 @@ pub fn run_ypir_on_params<const K: usize>(
         // ONLINE PHASE
         // ================================================================
 
+        let start_load = Instant::now();
+        if write_to_file {
+            use std::io::Read;
+            let mut file = std::fs::File::open("/tmp/ypir_db.bin").unwrap();
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).unwrap();
+        }
+        let server_data_load_time_us = start_load.elapsed().as_micros();
+        measurement.online.server_data_load_time_us = server_data_load_time_us as usize;
+
         let start_online_comp = Instant::now();
         let responses = y_server.perform_online_computation::<K>(
             &mut offline_values,
@@ -513,6 +576,8 @@ pub fn run_ypir_on_params<const K: usize>(
             Some(&mut measurement),
         );
         let online_server_time_ms = start_online_comp.elapsed().as_millis();
+        let server_response_latency_us = start_load.elapsed().as_micros();
+        measurement.online.server_response_latency_us = server_response_latency_us as usize;
         let online_download_bytes = get_size_bytes(&responses); // TODO: this is not quite right for multiple clients
 
         // check correctness

@@ -20,6 +20,7 @@ pub struct Offline {
     pub simplepir_prep_time_ms: usize,
     pub simplepir_hint_bytes: usize,
     pub doublepir_hint_bytes: usize,
+    pub server_long_term_storage_bytes: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -40,6 +41,8 @@ pub struct Online {
     pub sqrt_n_bytes: usize,
     pub all_server_times_ms: Vec<usize>,
     pub std_dev_server_time_ms: f64,
+    pub server_data_load_time_us: usize,
+    pub server_response_latency_us: usize,
 }
 
 pub fn get_vec_pm_size_bytes(v_p: &[PolyMatrixNTT]) -> usize {

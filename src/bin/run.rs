@@ -27,6 +27,10 @@ struct Args {
     /// if set, the program will print debug logs to stderr.
     #[clap(long, short, action)]
     verbose: bool,
+    /// Write to file flag
+    /// if set, writes database state to disk and drops cache
+    #[clap(long, short, action)]
+    write_to_file: bool,
 }
 
 fn main() {
@@ -39,6 +43,7 @@ fn main() {
         out_report_json,
         verbose,
         is_simplepir,
+        write_to_file,
     } = args;
 
     if verbose {
@@ -73,7 +78,7 @@ fn main() {
     );
 
     let measurement =
-        run_ypir_batched(num_items, item_size_bits, num_clients, is_simplepir, trials);
+        run_ypir_batched(num_items, item_size_bits, num_clients, is_simplepir, trials, write_to_file);
     println!(
         "Measurement completed. See the README for details on what the following fields mean."
     );
