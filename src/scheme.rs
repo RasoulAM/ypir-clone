@@ -434,9 +434,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(
             // debug!("got {:?}, expected {:?}", &final_result[..256], &corr_result[..256]);
             assert_eq!(final_result, corr_result.as_slice());
         }
-        if write_to_file {
-            println!("[trial {}] correctness check passed", trial);
-        }
+        println!("[trial {}] correctness check passed", trial);
 
         measurement.online.upload_bytes = online_upload_bytes;
         measurement.online.download_bytes = online_download_bytes;
@@ -833,6 +831,7 @@ pub fn run_ypir_on_params<const K: usize>(
             // debug!("was correct? {}", final_result == corr_result);
             assert_eq!(final_result, corr_result);
         }
+        println!("[trial {}] correctness check passed", trial);
 
         measurement.online.upload_bytes = online_upload_bytes;
         measurement.online.download_bytes = online_download_bytes;
