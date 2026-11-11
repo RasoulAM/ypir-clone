@@ -1011,8 +1011,13 @@ pub fn pack_many_lwes<'a>(
     pack_pub_params_row_1s: &[PolyMatrixNTT<'a>],
     y_constants: &(Vec<PolyMatrixNTT<'a>>, Vec<PolyMatrixNTT<'a>>),
 ) -> Vec<PolyMatrixNTT<'a>> {
-    assert_eq!(prep_rlwe_cts.len(), num_rlwe_outputs);
-    assert_eq!(prep_rlwe_cts[0].len(), params.poly_len);
+    // `prep_rlwe_cts` is only shape-checked here; everything needed online is
+    // in `precomp`. SSD mode does not store it and passes an empty slice.
+    if !prep_rlwe_cts.is_empty() {
+        assert_eq!(prep_rlwe_cts.len(), num_rlwe_outputs);
+        assert_eq!(prep_rlwe_cts[0].len(), params.poly_len);
+    }
+    assert_eq!(precomp.len(), num_rlwe_outputs);
     assert_eq!(b_values.len(), num_rlwe_outputs * params.poly_len);
 
     let mut res = Vec::new();

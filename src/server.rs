@@ -576,7 +576,7 @@ where
     pub fn perform_offline_precomputation_simplepir(
         &self,
         measurement: Option<&mut Measurement>,
-    ) -> OfflinePrecomputedValues {
+    ) -> OfflinePrecomputedValues<'a> {
         // Set up some parameters
 
         let params = self.params;
@@ -1135,6 +1135,34 @@ where
                 self.db_buf_aligned.len() * 8 / std::mem::size_of::<u32>(),
             )
         }
+    }
+
+    /// Size in bytes of the (padded, transposed) database buffer.
+    pub fn db_size_bytes(&self) -> usize {
+        self.db_rows_padded() * self.db_cols() * std::mem::size_of::<T>()
+    }
+
+    /// Frees the database buffer (used in SSD mode so that the database does
+    /// not silently stay resident between queries).
+    pub fn release_db(&mut self) {
+        self.db_buf_aligned = AlignedMemory64::new(8);
+    }
+
+    /// Allocates a fresh (lazily zeroed) database buffer and returns it as
+    /// bytes so that it can be filled from storage.
+    pub fn alloc_db_bytes(&mut self) -> &mut [u8] {
+        let sz_bytes = self.db_size_bytes();
+        assert_eq!(sz_bytes % 8, 0);
+        self.db_buf_aligned = AlignedMemory64::new(sz_bytes / 8);
+        as_bytes_mut(&mut self.db_buf_aligned)
+    }
+
+    pub fn db_bytes(&self) -> &[u8] {
+        as_bytes(&self.db_buf_aligned)
+    }
+
+    pub fn db_bytes_mut(&mut self) -> &mut [u8] {
+        as_bytes_mut(&mut self.db_buf_aligned)
     }
 
     pub fn get_elem(&self, row: usize, col: usize) -> T {

@@ -13,5 +13,6 @@ pub mod packing;
 pub mod params;
 pub mod scheme;
 pub mod server;
+pub mod ssd;
 pub mod transpose;
 pub mod util;

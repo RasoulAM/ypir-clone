@@ -21,6 +21,9 @@ pub struct Offline {
     pub simplepir_hint_bytes: usize,
     pub doublepir_hint_bytes: usize,
     pub server_long_term_storage_bytes: usize,
+    /// SSD mode: database-independent (params/seed-derived) server state that
+    /// stays resident in RAM across databases.
+    pub server_seed_state_in_memory_bytes: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -43,6 +46,12 @@ pub struct Online {
     pub std_dev_server_time_ms: f64,
     pub server_data_load_time_us: usize,
     pub server_response_latency_us: usize,
+    /// SSD mode: phases of server_data_load_time_us.
+    pub server_load_read_time_us: usize,
+    pub server_load_parse_time_us: usize,
+    pub server_load_derive_time_us: usize,
+    /// Query answering only (excludes load), in microseconds.
+    pub server_compute_time_us: usize,
 }
 
 pub fn get_vec_pm_size_bytes(v_p: &[PolyMatrixNTT]) -> usize {

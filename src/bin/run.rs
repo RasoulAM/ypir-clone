@@ -1,4 +1,4 @@
-use ypir::scheme::run_ypir_batched;
+use ypir::scheme::{run_ypir_batched_with_ssd, SsdOptions};
 
 use clap::Parser;
 
@@ -31,6 +31,10 @@ struct Args {
     /// if set, writes database state to disk and drops cache
     #[clap(long, short, action)]
     write_to_file: bool,
+    /// SSD mode (YPIR+SP): also store the zero padding of the database layout
+    /// instead of re-creating it during the load (old behaviour).
+    #[clap(long, action)]
+    ssd_store_padding: bool,
 }
 
 fn main() {
@@ -44,6 +48,7 @@ fn main() {
         verbose,
         is_simplepir,
         write_to_file,
+        ssd_store_padding,
     } = args;
 
     if verbose {
@@ -78,7 +83,17 @@ fn main() {
     );
 
     let measurement =
-        run_ypir_batched(num_items, item_size_bits, num_clients, is_simplepir, trials, write_to_file);
+        run_ypir_batched_with_ssd(
+            num_items,
+            item_size_bits,
+            num_clients,
+            is_simplepir,
+            trials,
+            SsdOptions {
+                write_to_file,
+                store_padding: ssd_store_padding,
+            },
+        );
     println!(
         "Measurement completed. See the README for details on what the following fields mean."
     );

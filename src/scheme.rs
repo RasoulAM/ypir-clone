@@ -32,11 +32,40 @@ pub fn run_ypir_batched(
     trials: usize,
     write_to_file: bool,
 ) -> Measurement {
+    run_ypir_batched_with_ssd(
+        num_items,
+        item_size_bits,
+        num_clients,
+        is_simplepir,
+        trials,
+        SsdOptions {
+            write_to_file,
+            store_padding: false,
+        },
+    )
+}
+
+pub fn run_ypir_batched_with_ssd(
+    num_items: usize,
+    item_size_bits: usize,
+    num_clients: usize,
+    is_simplepir: bool,
+    trials: usize,
+    ssd: SsdOptions,
+) -> Measurement {
+    let write_to_file = ssd.write_to_file;
     let params = if is_simplepir {
         params_for_scenario_simplepir(num_items, item_size_bits)
     } else {
         params_for_scenario(num_items, item_size_bits)
     };
+    if is_simplepir {
+        assert_eq!(num_clients, 1, "SimplePIR variant only supports 1 client.");
+        let measurement =
+            run_simple_ypir_on_params::<1>(params, trials, num_items, item_size_bits, ssd);
+        debug!("{:#?}", measurement);
+        return measurement;
+    }
     let measurement = match num_clients {
         1 => run_ypir_on_params::<1>(params, is_simplepir, trials, write_to_file),
         2 => run_ypir_on_params::<2>(params, is_simplepir, trials, write_to_file),
@@ -72,13 +101,39 @@ impl Sample for u16 {
     }
 }
 
-pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize, write_to_file: bool) -> Measurement {
+/// Options for the "server data on SSD" mode.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SsdOptions {
+    /// Store the server's DB-dependent state on SSD and load it per query.
+    pub write_to_file: bool,
+    /// Also store the zero padding of the YPIR+SP database layout (rows padded
+    /// to a power of two, items padded to instances * 2048 coefficients). By
+    /// default only the real data is stored and the padding is re-created
+    /// (zero-filled) during the load.
+    pub store_padding: bool,
+}
+
+pub fn run_simple_ypir_on_params<const K: usize>(
+    params: Params,
+    trials: usize,
+    num_items: usize,
+    item_size_bits: usize,
+    ssd: SsdOptions,
+) -> Measurement {
     assert_eq!(K, 1); // for now
+    let write_to_file = ssd.write_to_file;
 
     let is_simplepir = true;
     let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
     let db_rows_padded = params.db_rows_padded();
     let db_cols = params.instances * params.poly_len;
+
+    // Part of the (padded) database that holds real data: `num_items` rows
+    // (items), each using ceil(item_size_bits / pt_bits) coefficients. The
+    // rest is zero padding imposed by the YPIR+SP layout.
+    let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
+    let used_rows = num_items.min(db_rows);
+    let used_cols = ((item_size_bits + pt_bits - 1) / pt_bits).min(db_cols);
 
     let mut rng = thread_rng();
 
@@ -95,18 +150,44 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize, 
 
     let now = Instant::now();
     type T = u16;
-    let pt_iter = std::iter::repeat_with(|| (T::sample() as u64 % params.pt_modulus) as T);
-    let y_server = YServer::<T>::new(&params, pt_iter, is_simplepir, false, true);
+    let mut gen_idx = 0usize;
+    let pt_iter = std::iter::repeat_with(|| {
+        // YServer::new consumes the items row-major (row = item).
+        let (i, j) = (gen_idx / db_cols, gen_idx % db_cols);
+        gen_idx += 1;
+        if i < used_rows && j < used_cols {
+            (T::sample() as u64 % params.pt_modulus) as T
+        } else {
+            0
+        }
+    });
+    let mut y_server = YServer::<T>::new(&params, pt_iter, is_simplepir, false, true);
     debug!("Created server in {} us", now.elapsed().as_micros());
     debug!(
         "Database of {} bytes",
         y_server.db().len() * (params.pt_modulus as f64).log2().ceil() as usize / 8
     );
-    // assert_eq!(
-    //     y_server.db().len() * std::mem::size_of::<T>(),
-    //     db_rows_padded * db_cols * (params.pt_modulus as f64).log2().ceil() as usize / 8
-    // );
+    debug!(
+        "db_rows: {}, db_cols: {}, used_rows: {}, used_cols: {}",
+        db_rows, db_cols, used_rows, used_cols
+    );
     assert_eq!(y_server.db().len(), db_rows_padded * db_cols);
+
+    // Targets (and the expected answers) are fixed up front so that the
+    // correctness check does not rely on the database that the server loads.
+    let targets: Vec<usize> = (0..trials + 1)
+        .map(|_| (rng.gen::<usize>() % used_rows) * db_cols + rng.gen::<usize>() % db_cols)
+        .collect();
+    let expected_rows: Vec<Vec<u64>> = targets
+        .iter()
+        .map(|t| {
+            y_server
+                .get_row(t / db_cols)
+                .iter()
+                .map(|x| x.to_u64())
+                .collect::<Vec<_>>()
+        })
+        .collect();
 
     // ================================================================
     // OFFLINE PHASE
@@ -114,27 +195,62 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize, 
     let mut measurements = vec![Measurement::default(); trials + 1];
 
     let start_offline_comp = Instant::now();
-    let offline_values =
+    let mut offline_values =
         y_server.perform_offline_precomputation_simplepir(Some(&mut measurements[0]));
     let offline_server_time_ms = start_offline_comp.elapsed().as_millis();
 
+    let mut resident_tables: Vec<Vec<usize>> = Vec::new();
     if write_to_file {
-        use std::io::Write;
-        use std::os::unix::io::AsRawFd;
-        let mut file = std::fs::File::create("/tmp/ypir_db.bin").unwrap();
-        let db = y_server.db();
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(db.as_ptr() as *const u8, db.len() * std::mem::size_of::<T>())
+        let layout = if ssd.store_padding {
+            crate::ssd::DbLayout {
+                db_rows: db_rows_padded,
+                db_cols,
+                stored_rows: db_rows_padded,
+                stored_cols: db_cols,
+                elem_size: std::mem::size_of::<T>(),
+            }
+        } else {
+            crate::ssd::DbLayout {
+                db_rows: db_rows_padded,
+                db_cols,
+                stored_rows: used_rows,
+                stored_cols: used_cols,
+                elem_size: std::mem::size_of::<T>(),
+            }
         };
-        file.write_all(bytes).unwrap();
-        file.sync_data().unwrap();
-        
-        let total_size = file.metadata().unwrap().len() as usize;
+        let t = Instant::now();
+        let total_size = crate::ssd::write_state(
+            crate::ssd::SSD_FILE,
+            &params,
+            &y_server,
+            &offline_values.precomp,
+            layout,
+        );
+        debug!("Wrote SSD state in {} us", t.elapsed().as_micros());
         measurements[0].offline.server_long_term_storage_bytes = total_size;
-        
-        unsafe {
-            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
-        }
+
+        // Database-independent (parameter-derived) state stays resident:
+        // y_constants and the NTT automorphism tables.
+        resident_tables = offline_values.precomp[0].2.clone();
+        let seed_bytes = crate::ssd::resident_state_bytes(
+            &params,
+            &offline_values.y_constants,
+            &resident_tables,
+        );
+        measurements[0].offline.server_seed_state_in_memory_bytes = seed_bytes;
+        println!("Server Long term Storage: {} bytes", total_size);
+        println!("Server Seed-Derived State In Memory: {} bytes", seed_bytes);
+        println!(
+            "SSD layout: db {}x{} (u16, transposed), stored {}x{}, store_padding={}",
+            db_rows_padded, db_cols, layout.stored_rows, layout.stored_cols, ssd.store_padding
+        );
+
+        // Everything DB-dependent must now come from the SSD.
+        y_server.release_db();
+        offline_values.hint_0 = Vec::new();
+        offline_values.prepacked_lwe = Vec::new();
+        offline_values.fake_pack_pub_params = Vec::new();
+        offline_values.precomp = Vec::new();
     }
 
     let packed_query_row_sz = params.db_rows_padded();
@@ -154,7 +270,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize, 
         let mut clients = (0..K).map(|_| Client::init(&params)).collect::<Vec<_>>();
 
         for (_batch, client) in (0..K).zip(clients.iter_mut()) {
-            let target_idx: usize = rng.gen::<usize>() % (db_rows * db_cols);
+            let target_idx: usize = targets[trial];
             let target_row = target_idx / db_cols;
             let target_col = target_idx % db_cols;
             debug!(
@@ -215,7 +331,17 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize, 
             (&mut chunk_mut[..db_rows]).copy_from_slice(queries[i].2.as_slice());
         }
 
-        let offline_values = offline_values.clone();
+        // In-memory mode: answer from the offline values computed above
+        // (cloned, untimed, as before). SSD mode: drop whatever the previous
+        // trial loaded and make sure the next load reads from the SSD.
+        let trial_offline_values = if write_to_file {
+            y_server.release_db();
+            offline_values.precomp = Vec::new();
+            crate::ssd::evict_from_page_cache(crate::ssd::SSD_FILE);
+            None
+        } else {
+            Some(offline_values.clone())
+        };
 
         // ================================================================
         // ONLINE PHASE
@@ -223,37 +349,55 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize, 
 
         let start_load = Instant::now();
         if write_to_file {
-            use std::io::Read;
-            let mut file = std::fs::File::open("/tmp/ypir_db.bin").unwrap();
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf).unwrap();
+            let (precomp, times) = crate::ssd::load_state(
+                crate::ssd::SSD_FILE,
+                &params,
+                &mut y_server,
+                &resident_tables,
+            );
+            offline_values.precomp = precomp;
+            measurement.online.server_load_read_time_us = times.read_us;
+            measurement.online.server_load_parse_time_us = times.parse_us;
+            measurement.online.server_load_derive_time_us = times.derive_us;
         }
         let server_data_load_time_us = start_load.elapsed().as_micros();
         measurement.online.server_data_load_time_us = server_data_load_time_us as usize;
 
         let start_online_comp = Instant::now();
+        let ov: &OfflinePrecomputedValues = match &trial_offline_values {
+            Some(v) => v,
+            None => &offline_values,
+        };
         let responses = vec![y_server.perform_online_computation_simplepir(
             all_queries_packed.as_slice(),
-            &offline_values,
+            ov,
             &queries.iter().map(|x| x.3.as_slice()).collect::<Vec<_>>(),
             Some(&mut measurement),
         )];
         let online_server_time_ms = start_online_comp.elapsed().as_millis();
+        measurement.online.server_compute_time_us = start_online_comp.elapsed().as_micros() as usize;
         let server_response_latency_us = start_load.elapsed().as_micros();
         measurement.online.server_response_latency_us = server_response_latency_us as usize;
+        if write_to_file {
+            println!(
+                "[trial {}] load {} us (read {} / parse {} / derive {}), compute {} us, latency {} us",
+                trial,
+                measurement.online.server_data_load_time_us,
+                measurement.online.server_load_read_time_us,
+                measurement.online.server_load_parse_time_us,
+                measurement.online.server_load_derive_time_us,
+                measurement.online.server_compute_time_us,
+                measurement.online.server_response_latency_us
+            );
+        }
         
         let online_download_bytes = get_size_bytes(&responses); // TODO: this is not quite right for multiple clients
 
         // check correctness
-        for (response_switched, (y_client, target_idx, _, _)) in
+        for (response_switched, (y_client, _target_idx, _, _)) in
             responses.iter().zip(queries.iter())
         {
-            let (target_row, _target_col) = (target_idx / db_cols, target_idx % db_cols);
-            let corr_result = y_server
-                .get_row(target_row)
-                .iter()
-                .map(|x| x.to_u64())
-                .collect::<Vec<_>>();
+            let corr_result = &expected_rows[trial];
 
             // let scheme_params = YPIRSchemeParams::from_params(&params, &lwe_params);
             // let log2_corr_err = scheme_params.delta().log2();
@@ -288,12 +432,19 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize, 
             // debug!("got      {:?}", &final_result[..256]);
             // debug!("expected {:?}", &corr_result[..256]);
             // debug!("got {:?}, expected {:?}", &final_result[..256], &corr_result[..256]);
-            assert_eq!(final_result, corr_result);
+            assert_eq!(final_result, corr_result.as_slice());
+        }
+        if write_to_file {
+            println!("[trial {}] correctness check passed", trial);
         }
 
         measurement.online.upload_bytes = online_upload_bytes;
         measurement.online.download_bytes = online_download_bytes;
         measurement.online.server_time_ms = online_server_time_ms as usize;
+    }
+    if write_to_file {
+        y_server.release_db();
+        let _ = std::fs::remove_file(crate::ssd::SSD_FILE);
     }
 
     // discard the first measurement (if there were multiple trials)
@@ -318,6 +469,16 @@ pub fn run_simple_ypir_on_params<const K: usize>(params: Params, trials: usize, 
     final_measurement.online.std_dev_server_time_ms =
         std_dev(&final_measurement.online.all_server_times_ms);
 
+    if write_to_file {
+        let o = &final_measurement.online;
+        println!("Server Load Read Time: {} us", o.server_load_read_time_us);
+        println!("Server Load Parse Time: {} us", o.server_load_parse_time_us);
+        println!("Server Load Derive Time: {} us", o.server_load_derive_time_us);
+        println!("Server Total Load Time: {} us", o.server_data_load_time_us);
+        println!("Server Compute Time: {} us", o.server_compute_time_us);
+        println!("Server Response Latency: {} us", o.server_response_latency_us);
+    }
+
     final_measurement
 }
 
@@ -328,7 +489,16 @@ pub fn run_ypir_on_params<const K: usize>(
     write_to_file: bool,
 ) -> Measurement {
     if is_simplepir {
-        return run_simple_ypir_on_params::<K>(params, trials, write_to_file);
+        // Use run_ypir_batched for YPIR+SP (it needs the item layout).
+        panic!("run_ypir_on_params: use run_ypir_batched for the SimplePIR variant");
+    }
+    if write_to_file {
+        // NOTE: the DoublePIR variant's SSD mode is not used by the
+        // pir-comparison harness (run_ypir.sh passes --is-simplepir) and has
+        // NOT been audited: it only re-reads the raw DB into a throwaway
+        // buffer while the online phase runs on the in-memory DB and offline
+        // values. Do not report its SSD numbers.
+        eprintln!("WARNING: DoublePIR --write-to-file mode is not a faithful SSD mode (see scheme.rs)");
     }
     let lwe_params = LWEParams::default();
 
@@ -715,73 +885,73 @@ mod test {
 
     #[test]
     fn test_ypir_basic() {
-        run_ypir_batched(1 << 30, 1, 1, false, 1);
+        run_ypir_batched(1 << 30, 1, 1, false, 1, false);
     }
 
     #[test]
     fn test_ypir_simplepir_basic() {
-        run_ypir_batched(1 << 17, 65536 * 8, 1, true, 1);
+        run_ypir_batched(1 << 17, 65536 * 8, 1, true, 1, false);
     }
 
     #[test]
     fn test_ypir_simplepir_rectangle() {
-        run_ypir_batched(1 << 16, 16384 * 8, 1, true, 1);
+        run_ypir_batched(1 << 16, 16384 * 8, 1, true, 1, false);
     }
 
     #[test]
     fn test_ypir_simplepir_rectangle_8gb() {
-        run_ypir_batched(1 << 17, 65536 * 8, 1, true, 1);
+        run_ypir_batched(1 << 17, 65536 * 8, 1, true, 1, false);
     }
 
     #[test]
     fn test_ypir_many_clients() {
-        run_ypir_batched(1 << 30, 1, 2, false, 1);
+        run_ypir_batched(1 << 30, 1, 2, false, 1, false);
     }
 
     #[test]
     fn test_ypir_many_clients_and_trials() {
-        run_ypir_batched(1 << 30, 1, 2, false, 5);
+        run_ypir_batched(1 << 30, 1, 2, false, 5, false);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_1gb() {
-        run_ypir_batched(1 << 33, 1, 1, false, 5);
+        run_ypir_batched(1 << 33, 1, 1, false, 5, false);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_2gb() {
-        run_ypir_batched(1 << 34, 1, 1, false, 5);
+        run_ypir_batched(1 << 34, 1, 1, false, 5, false);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_4gb() {
-        run_ypir_batched(1 << 35, 1, 1, false, 5);
+        run_ypir_batched(1 << 35, 1, 1, false, 5, false);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_8gb() {
-        run_ypir_batched(1 << 36, 1, 1, false, 5);
+        run_ypir_batched(1 << 36, 1, 1, false, 5, false);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_16gb() {
-        run_ypir_batched(1 << 37, 1, 1, false, 5);
+        run_ypir_batched(1 << 37, 1, 1, false, 5, false);
     }
 
     #[test]
     #[ignore]
     fn test_ypir_32gb() {
-        run_ypir_batched(1 << 38, 1, 1, false, 5);
+        run_ypir_batched(1 << 38, 1, 1, false, 5, false);
     }
 
     #[test]
     #[ignore]
     fn test_batched_4_ypir() {
-        run_ypir_batched(1 << 30, 1, 4, false, 5);
+        run_ypir_batched(1 << 30, 1, 4, false, 5, false);
     }
 }
