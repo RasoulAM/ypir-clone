@@ -78,6 +78,52 @@ pub fn evict_from_page_cache(path: &str) {
     }
 }
 
+/// Page-cache residency of the given files (untimed diagnostic): mmaps each
+/// file read-only and asks `mincore` which of its pages are resident.
+/// Returns `(resident_pages, total_pages)` summed over all files.
+pub fn page_cache_residency(paths: &[&str]) -> (usize, usize) {
+    use std::os::unix::io::AsRawFd;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let (mut resident, mut total) = (0usize, 0usize);
+    for path in paths {
+        let file = std::fs::File::open(path).unwrap();
+        let len = file.metadata().unwrap().len() as usize;
+        if len == 0 {
+            continue;
+        }
+        let pages = (len + page - 1) / page;
+        let mut vec = vec![0u8; pages];
+        unsafe {
+            let addr = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            );
+            assert!(addr != libc::MAP_FAILED, "mmap failed for {}", path);
+            let rc = libc::mincore(addr, len, vec.as_mut_ptr());
+            libc::munmap(addr, len);
+            assert_eq!(rc, 0, "mincore failed for {}", path);
+        }
+        resident += vec.iter().filter(|&&b| b & 1 != 0).count();
+        total += pages;
+    }
+    (resident, total)
+}
+
+/// Prints the page-cache residency of the server-state file(s); call after
+/// eviction and before the timed load.
+pub fn print_page_cache_residency_before_load(paths: &[&str]) {
+    let (resident, total) = page_cache_residency(paths);
+    let pct = if total == 0 { 0.0 } else { 100.0 * resident as f64 / total as f64 };
+    println!(
+        "Server Page Cache Residency Before Load: {}/{} pages ({:.3}%)",
+        resident, total, pct
+    );
+}
+
 /// Writes the DB-dependent server state, fdatasyncs it and evicts it from the
 /// page cache. Returns the file size in bytes.
 pub fn write_state<'a, T>(

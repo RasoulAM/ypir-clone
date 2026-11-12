@@ -338,6 +338,7 @@ pub fn run_simple_ypir_on_params<const K: usize>(
             y_server.release_db();
             offline_values.precomp = Vec::new();
             crate::ssd::evict_from_page_cache(crate::ssd::SSD_FILE);
+            crate::ssd::print_page_cache_residency_before_load(&[crate::ssd::SSD_FILE]);
             None
         } else {
             Some(offline_values.clone())
@@ -718,6 +719,11 @@ pub fn run_ypir_on_params<const K: usize>(
         }
 
         let mut offline_values = offline_values.clone();
+
+        if write_to_file {
+            // Untimed: the file was evicted after it was written (offline).
+            crate::ssd::print_page_cache_residency_before_load(&["/tmp/ypir_db.bin"]);
+        }
 
         // ================================================================
         // ONLINE PHASE
